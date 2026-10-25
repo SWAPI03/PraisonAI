@@ -2201,7 +2201,11 @@ class AgentTeam(SpawnAnnounceProtocol):
         # Re-entrant on the owning thread so batch runs (astart_for_each) can hold
         # the guard across the whole batch while still calling astart() per item.
         with self._guard_execution():
-            return await self._astart_impl(content=content, return_dict=return_dict, **kwargs)
+            self._reset_if_previous_run_finished()
+            try:
+                return await self._astart_impl(content=content, return_dict=return_dict, **kwargs)
+            finally:
+                self._previous_run_finished = True
 
     async def _astart_impl(self, content=None, return_dict=False, **kwargs):
         # Track execution via telemetry
@@ -2215,6 +2219,7 @@ class AgentTeam(SpawnAnnounceProtocol):
                     if not task.context:
                         task.context = []
                     task.context.append(content)
+                    self._injected_content.append((task, content))
 
         if self.planning:
             await self._arun_with_planning()
@@ -2519,8 +2524,12 @@ class AgentTeam(SpawnAnnounceProtocol):
         # Re-entrant on the owning thread so batch runs (start_for_each) can hold
         # the guard across the whole batch while still calling start() per item.
         with self._guard_execution():
-            return self._start_impl(content=content, return_dict=return_dict,
-                                    output=output, **kwargs)
+            self._reset_if_previous_run_finished()
+            try:
+                return self._start_impl(content=content, return_dict=return_dict,
+                                        output=output, **kwargs)
+            finally:
+                self._previous_run_finished = True
 
     def _start_impl(self, content=None, return_dict=False, output=None, **kwargs):
         # Track execution via telemetry
@@ -2551,6 +2560,7 @@ class AgentTeam(SpawnAnnounceProtocol):
                     if not task.context:
                         task.context = []
                     task.context.append(content)
+                    self._injected_content.append((task, content))
         
         # ─────────────────────────────────────────────────────────────
         # Verbose Mode: Show Rich panels for multi-agent workflow
@@ -2771,6 +2781,25 @@ class AgentTeam(SpawnAnnounceProtocol):
             if hasattr(task, "retry_count"):
                 task.retry_count = 0
             task.variables = {}
+
+    def _reset_if_previous_run_finished(self):
+        """Make a repeated ``start()``/``astart()`` a fresh run.
+
+        ``run_task``/``arun_task`` skip tasks whose status is "completed", so
+        without this a second ``start()`` on the same team executed nothing and
+        returned the previous run's output. Resetting only once a previous run
+        has finished keeps ``restore_session_state()`` + ``start()`` resuming,
+        and also drops the ``content`` the previous run appended to task context.
+        """
+        if getattr(self, "_previous_run_finished", False):
+            self._reset_task_state_for_item()
+            for task, item in getattr(self, "_injected_content", ()):
+                try:
+                    task.context.remove(item)
+                except (AttributeError, ValueError):
+                    pass
+        self._previous_run_finished = False
+        self._injected_content = []
 
     def _restore_task_state(self, snapshot):
         """Restore per-task run state captured by ``_snapshot_task_state``."""
@@ -3131,6 +3160,9 @@ class AgentTeam(SpawnAnnounceProtocol):
             if state.get("variables"):
                 task.variables = state["variables"]
             restored += 1
+        if restored:
+            # A restored checkpoint is meant to be resumed, not reset.
+            self._previous_run_finished = False
         return restored
 
     @staticmethod
